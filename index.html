@@ -36,7 +36,7 @@
     --shadow-tight:0 6px 18px -6px rgba(43, 42, 40, 0.25);
 
     --ease: cubic-bezier(.22,.61,.36,1);
-    --dur-slide: 900ms;
+    --dur-slide: 420ms;
   }
 
   *{ box-sizing: border-box; }
@@ -132,6 +132,7 @@
     flex: 1 1 auto;
     min-height:0;
     overflow:hidden;
+    contain: layout paint;
   }
 
   /* The hand-off divider between image and control bar */
@@ -163,13 +164,18 @@
     align-items:center;
     justify-content:center;
     opacity:0;
-    transform: scale(1.015);
-    transition: opacity var(--dur-slide) var(--ease), transform var(--dur-slide) var(--ease);
+    /* opacity-only crossfade: a scale transform here forces the browser to
+       repaint/composite a full-resolution bitmap every frame, which is what
+       was causing the mobile lag. Plain opacity is compositor-only (GPU),
+       so it stays smooth even with very large source images. */
+    transition: opacity var(--dur-slide) var(--ease);
     pointer-events:none;
+    will-change: opacity;
+    contain: layout paint;     /* isolate each slide's paint work from the rest of the page */
+    backface-visibility: hidden;
   }
   .slide.active{
     opacity:1;
-    transform: scale(1);
     pointer-events:auto;
     z-index:2;
   }
@@ -451,23 +457,39 @@ const EXT_CANDIDATES = ['jpg', 'jpeg', 'png', 'webp'];    // tried in order
 
 /* ==================================================================
    BUILD SLIDES
-   For each slide number, try each extension until one loads
-   successfully, then render it. This keeps the page working
-   regardless of which image format was actually saved.
+   Performance note: these source images are very large (7200x10800).
+   Decoding six of them at once was the main cause of mobile lag, so
+   instead of loading every image up front, we only detect each
+   image's real extension here, then lazily MOUNT the actual <img>
+   for whichever slides are current / previous / next. Anything
+   further away gets its <img> removed again to free memory.
    ================================================================== */
 const slidesContainer = document.getElementById('slidesContainer');
 const dotsContainer   = document.getElementById('dots');
 let currentIndex = 0;
 const slideEls = [];
 const dotEls = [];
+const resolvedSrc = [];   // resolved image URL per slide, filled in async
+const missingSlide = [];  // true if no matching file was found at all
 
 function resolveImageSrc(num, extIndex, onSuccess, onFail){
   if (extIndex >= EXT_CANDIDATES.length){ onFail(); return; }
   const testUrl = `${num}.${EXT_CANDIDATES[extIndex]}`;
-  const tester = new Image();
-  tester.onload  = () => onSuccess(testUrl);
-  tester.onerror = () => resolveImageSrc(num, extIndex + 1, onSuccess, onFail);
-  tester.src = testUrl;
+
+  // HEAD request: confirms the file exists without decoding it (fast,
+  // no memory cost). Falls back to the old Image() probe only if HEAD
+  // isn't available, e.g. when opened directly as a file:// page.
+  fetch(testUrl, { method: 'HEAD' })
+    .then((res) => {
+      if (res.ok) onSuccess(testUrl);
+      else resolveImageSrc(num, extIndex + 1, onSuccess, onFail);
+    })
+    .catch(() => {
+      const tester = new Image();
+      tester.onload  = () => onSuccess(testUrl);
+      tester.onerror = () => resolveImageSrc(num, extIndex + 1, onSuccess, onFail);
+      tester.src = testUrl;
+    });
 }
 
 function buildSlide(num){
@@ -481,18 +503,15 @@ function buildSlide(num){
 
   resolveImageSrc(num, 0,
     (src) => {
-      const img = document.createElement('img');
-      img.src = src;
-      img.alt = `Invitation page ${num}`;
-      img.draggable = false;
-      slide.appendChild(img);
+      resolvedSrc[num - 1] = src;
+      missingSlide[num - 1] = false;
+      // Mount immediately only if this slide is inside the initial
+      // active window; otherwise it stays unmounted until needed.
+      if (isWithinMountWindow(num - 1)) mountSlideImage(num - 1);
     },
     () => {
-      // Graceful fallback if no matching file was found at all
-      const missing = document.createElement('div');
-      missing.className = 'missing';
-      missing.innerHTML = `<div>Page ${num}</div>`;
-      slide.appendChild(missing);
+      missingSlide[num - 1] = true;
+      renderMissingPlaceholder(num - 1);
     }
   );
 
@@ -505,7 +524,59 @@ function buildSlide(num){
   dotEls[num - 1] = dot;
 }
 
+function renderMissingPlaceholder(index){
+  const slide = slideEls[index];
+  if (!slide || slide.querySelector('.missing')) return;
+  const missing = document.createElement('div');
+  missing.className = 'missing';
+  missing.innerHTML = `<div>Page ${index + 1}</div>`;
+  slide.appendChild(missing);
+}
+
+// Only keep the current slide plus one on each side actually mounted.
+const MOUNT_RADIUS = 1;
+
+function isWithinMountWindow(index, center = currentIndex){
+  for (let d = -MOUNT_RADIUS; d <= MOUNT_RADIUS; d++){
+    if (((center + d) + TOTAL_SLIDES) % TOTAL_SLIDES === index) return true;
+  }
+  return false;
+}
+
+function mountSlideImage(index){
+  const slide = slideEls[index];
+  if (!slide || missingSlide[index]) return;
+  if (slide.querySelector('img')) return; // already mounted
+  const src = resolvedSrc[index];
+  if (!src) return; // extension not resolved yet — mountWindow() will retry once it lands
+
+  const img = document.createElement('img');
+  img.src = src;
+  img.alt = `Invitation page ${index + 1}`;
+  img.draggable = false;
+  img.decoding = 'async';
+  // The active slide loads eagerly and with priority; neighbors are
+  // still mounted (so swiping feels instant) but decode lazily.
+  img.loading = index === currentIndex ? 'eager' : 'lazy';
+  if ('fetchPriority' in img) img.fetchPriority = index === currentIndex ? 'high' : 'low';
+  slide.appendChild(img);
+}
+
+function unmountSlideImage(index){
+  const slide = slideEls[index];
+  const img = slide && slide.querySelector('img');
+  if (img) img.remove();
+}
+
+function updateMountWindow(){
+  for (let i = 0; i < TOTAL_SLIDES; i++){
+    if (isWithinMountWindow(i)) mountSlideImage(i);
+    else unmountSlideImage(i);
+  }
+}
+
 for (let i = 1; i <= TOTAL_SLIDES; i++) buildSlide(i);
+updateMountWindow(); // mount the initial current/prev/next trio
 
 /* ==================================================================
    SLIDE NAVIGATION
@@ -524,6 +595,8 @@ function goToSlide(index){
   slideEls[currentIndex]?.classList.add('active');
   dotEls[currentIndex]?.classList.add('active');
   curPageLabel.textContent = currentIndex + 1;
+
+  updateMountWindow(); // keep only current/prev/next decoded, drop the rest
 }
 
 document.getElementById('prevBtn').addEventListener('click', () => goToSlide(currentIndex - 1));
